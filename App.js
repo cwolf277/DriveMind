@@ -1,308 +1,219 @@
-import React, { useEffect, useState } from 'react';
-import {View, Text, Button, SafeAreaView,StyleSheet, StatusBar, TouchableOpacity } from 'react-native';
-import { Audio } from 'expo-av';
-import axios from 'axios';
-import * as FileSystem from 'expo-file-system';
-import { OPENAI_API_KEY } from '@env';
-import { Alert } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { GestureHandlerRootView,Swipeable } from 'react-native-gesture-handler';
+import React, { useCallback, useState } from 'react';
+import {
+  SafeAreaView,
+  View,
+  Text,
+  StyleSheet,
+  Switch,
+  Alert,
+  ActivityIndicator,
+} from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
+import { useRecording } from './hooks/useRecording';
+import { useNotes } from './hooks/useNotes';
+import {
+  useVoiceActivation,
+  hasWakePhrase,
+  stripWakePhrase,
+} from './hooks/useVoiceActivation';
+import { transcribeAudio } from './services/transcription';
+import { structureNote } from './services/noteStructuring';
+import { feedback } from './services/audioFeedback';
+import { storageBackend } from './services/storage';
 
+import { RecordButton } from './components/RecordButton';
+import { MoodSelector } from './components/MoodSelector';
+import { NotesFeed } from './components/NotesFeed';
 
 export default function App() {
-  const [recording, setRecording] = useState(null);
-  const [recordedURI, setRecordedURI] = useState(null);
-  const [notes, setNotes] = useState([]);
-  const [expandedNoteIndex, setExpandedNoteIndex] = useState(null);
+  const [processing, setProcessing] = useState(false);
+  const [pendingMood, setPendingMood] = useState(null);
+  const [useGPTStructuring, setUseGPTStructuring] = useState(false);
+  const [requireWakePhrase, setRequireWakePhrase] = useState(false);
 
-  const exportNotesToJSON =async () =>{
-  try{
-    const content = JSON.stringify(notes, null,2);
-    const fileUri = FileSystem.documentDirectory + 'drivemindNotes.json';
-    await FileSystem.writeAsStringAsync(fileUri,content,{
-      encoding: FileSystem.EncodingType.UTF8,
-    });
-    Alert.alert('Exportted',`saved to: ${fileUri}`);
-  }catch(err){
-    Alert.alert('Error', 'could not export notes.');
-    console.log(err);
-  }
-}
+  const recording = useRecording();
+  const { notes, addNote, removeNote, patchNote } = useNotes();
 
-const handleDeleteNote = (indexToDelete) => {
-  const updatedNotes = notes.filter((_, index) => index !== indexToDelete);
-  setNotes(updatedNotes);
-  AsyncStorage.setItem('driveMindNotes', JSON.stringify(updatedNotes));
-};
+  const ingestSegment = useCallback(
+    async (uri, { requireWakePhrase: needWake } = {}) => {
+      try {
+        setProcessing(true);
+        const { text: rawText, latencyMs } = await transcribeAudio(uri);
 
-  useEffect(()=>{
-    const loadNotes =async() => {
-      const saved = await AsyncStorage.getItem('driveMindNotes');
-      if(saved){
-        setNotes(JSON.parse(saved));
-      }
-    };
-    loadNotes();
-  }, []);
-
-  const startRecording = async() =>{
-    try{
-      console.log('Requesting permissions..');
-      const permission = await Audio.requestPermissionsAsync();
-      if(permission.status != 'granted'){
-        alert('Permission to acess microphone is required!');
-        return;
-      }
-      console.log('Starting recording..');
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-
-      const{recording} = await Audio.Recording.createAsync(
-        Audio.RECORDING_OPTIONS_PRESET_HIGH_QUALITY
-      );
-
-      setRecording(recording);
-      console.log('recording started');
-    }catch(err){
-      console.log('Could not start recording', err);
-    }
-  };
-
-  const stopRecording = async () => {
-    try{
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecordedURI(uri);
-      console.log('recording stopped and stored at', uri);
-      setRecording(null);
-      await transcribeAudio(uri);
-    }catch(err){
-      console.error('could not stop recording', err);
-    }
-  };
-
-  const transcribeAudio = async (uri) => {
-    try {
-      const fileInfo = await FileSystem.getInfoAsync(uri);
-
-      const formData = new FormData();
-      formData.append('file', {
-        uri: fileInfo.uri,
-        name: 'voice.m4a',
-        type: 'audio/m4a',
-      });
-      formData.append('model', 'whisper-1');
-
-      const response = await axios.post(
-        'https://api.openai.com/v1/audio/transcriptions',
-        formData,
-        {
-          headers: {
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-            'Content-Type': 'multipart/form-data',
-          },
+        let payloadText = rawText;
+        if (needWake) {
+          if (!hasWakePhrase(rawText)) {
+            setProcessing(false);
+            return;
+          }
+          feedback.wakeWordDetected();
+          payloadText = stripWakePhrase(rawText);
         }
-      );
 
-      const now = new Date().toLocaleString('en-US', {
-        month: 'long',
-        day: 'numeric',
-        year: 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12 :true,
-      });
-      const newNote = {
-        text: response.data.text,
-        timestamp: now,
-      };
+        if (!payloadText.trim()) {
+          setProcessing(false);
+          return;
+        }
 
-      setNotes(prevNotes => {
-        const updated = [newNote, ...prevNotes]
-        AsyncStorage.setItem('driveMindNotes', JSON.stringify(updated));
-        return updated;
-      });
+        const structured = await structureNote(payloadText, { useGPT: useGPTStructuring });
 
-     
-    } catch (error) {
-      console.error('Transcription failed:', error.response?.data || error.message);
-      Alert.alert('Error', 'Transcription failed.');
+        await addNote({
+          ...structured,
+          mood: pendingMood || structured.detectedMood || null,
+          timestamp: new Date().toISOString(),
+          audioUri: uri,
+          transcriptionLatencyMs: latencyMs,
+        });
+        setPendingMood(null);
+      } catch (err) {
+        console.warn('ingestSegment failed', err);
+        feedback.error('Transcription failed');
+        Alert.alert('Error', err.message || 'Could not process recording.');
+      } finally {
+        setProcessing(false);
+      }
+    },
+    [addNote, pendingMood, useGPTStructuring]
+  );
+
+  const voice = useVoiceActivation({
+    onSegmentCaptured: ingestSegment,
+    requireWakePhrase,
+  });
+
+  const onTapRecord = useCallback(async () => {
+    if (recording.isRecording) {
+      const uri = await recording.stop();
+      if (uri) await ingestSegment(uri, { requireWakePhrase: false });
+    } else {
+      await recording.start();
     }
-  };
+  }, [recording, ingestSegment]);
+
+  const handleListeningToggle = useCallback(
+    async (next) => {
+      if (next) {
+        await voice.startListening();
+      } else {
+        voice.stopListening();
+      }
+    },
+    [voice]
+  );
+
+  const handleDelete = useCallback(
+    async (id) => {
+      try {
+        await removeNote(id);
+      } catch (err) {
+        console.warn('delete failed', err);
+        feedback.error('Could not delete note');
+      }
+    },
+    [removeNote]
+  );
+
+  const handleChangeMood = useCallback(
+    async (id, mood) => {
+      try {
+        await patchNote(id, { mood });
+      } catch (err) {
+        console.warn('mood update failed', err);
+      }
+    },
+    [patchNote]
+  );
 
   return (
-    <GestureHandlerRootView style={{flex: 1}}>
-    <SafeAreaView style={styles.container}>
-      <Text style={styles.title}>DriveMind</Text>
-
-      <TouchableOpacity
-      style={styles.recordButton}
-      onPress={recording ? stopRecording:startRecording}
-      >
-        <Text style = {styles.recordButtonText}>
-          {recording ? 'Stop Recording' : 'Start Recording'}
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaView style={styles.container}>
+        <Text style={styles.title}>DriveMind</Text>
+        <Text style={styles.subtitle}>
+          Storage: {storageBackend === 'firebase' ? 'Firebase' : 'Local (set up Firebase to sync)'}
         </Text>
-      </TouchableOpacity>
-            
-          <View style={styles.feed}>
-          {notes.map((note, index) => {
-            const isExpanded = expandedNoteIndex === index;
-            const renderRightActions = () =>(
-              <TouchableOpacity
-              style={styles.deleteButton}
-              onPress={()=> handleDeleteNote(index)}
-              >
-                <Text style={styles.deleteText}>🗑️</Text>
-              </TouchableOpacity>
-            );
-            return(
-              <Swipeable key={index} renderRightActions={renderRightActions}>
-                <TouchableOpacity
-                 style={styles.noteCard}
-              onPress={()=>
-                setExpandedNoteIndex(isExpanded ? null:index)
-              }
-              >
-                <Text style={styles.noteTime}>{note.timestamp}</Text>
-                <Text 
-                style={styles.noteText}
-                numberOfLines={isExpanded ? 10:2}
-                ellipsizeMode='tail'
-                >
-                  {note.text}
-              </Text>
-              </TouchableOpacity>
-              </Swipeable>
-            );
-          })}
+
+        <View style={styles.controls}>
+          <View style={styles.row}>
+            <Text style={styles.rowLabel}>Listening mode</Text>
+            <Switch value={voice.isListening} onValueChange={handleListeningToggle} />
           </View>
-          </SafeAreaView>
-          </GestureHandlerRootView>
-        );
-      }
-             
-             
-              
-              
-              
-              
-         
+          {voice.isListening ? (
+            <View style={styles.row}>
+              <Text style={styles.rowLabel}>Require "Hey DriveMind"</Text>
+              <Switch value={requireWakePhrase} onValueChange={setRequireWakePhrase} />
+            </View>
+          ) : null}
+          <View style={styles.row}>
+            <Text style={styles.rowLabel}>Smart structuring (GPT)</Text>
+            <Switch value={useGPTStructuring} onValueChange={setUseGPTStructuring} />
+          </View>
+        </View>
+
+        <RecordButton
+          isRecording={recording.isRecording}
+          isProcessing={processing}
+          onPress={onTapRecord}
+          disabled={voice.isListening}
+        />
+
+        {voice.isListening ? (
+          <View style={styles.listeningRow}>
+            {voice.isCapturingSpeech ? <ActivityIndicator color="#9cf" /> : null}
+            <Text style={styles.listeningText}>
+              {voice.isCapturingSpeech ? 'Capturing speech…' : 'Listening for speech…'}
+            </Text>
+          </View>
+        ) : null}
+
+        <Text style={styles.sectionLabel}>Mood for next note</Text>
+        <MoodSelector value={pendingMood} onChange={setPendingMood} />
+
+        <NotesFeed notes={notes} onDelete={handleDelete} onChangeMood={handleChangeMood} />
+      </SafeAreaView>
+    </GestureHandlerRootView>
+  );
+}
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#121212',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 16,
+    paddingTop: 24,
+    paddingHorizontal: 0,
   },
   title: {
-    fontSize: 32,
+    fontSize: 30,
     color: '#fff',
     fontWeight: 'bold',
-  },
-  buttonContainer:{
-    marginVertical: 16,
-
-  },
-  uri:{
-    marginTop: 20,
-    color:'#aaa',
-    fontSize: 12,
     textAlign: 'center',
   },
-
-  feed:{
-    marginTop: 20,
-    width: '90%',
+  subtitle: {
+    fontSize: 12,
+    color: '#888',
+    textAlign: 'center',
+    marginTop: 4,
+    marginBottom: 8,
   },
-
-  feedTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#ccc',
-    marginBottom: 10,
+  controls: { paddingHorizontal: 24, marginVertical: 8 },
+  row: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 4,
   },
-
-  noteCard: {
-    backgroundColor: '#1e1e1e',
-    borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    marginBottom: 12,
+  rowLabel: { color: '#ddd', fontSize: 14 },
+  listeningRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
   },
-
-noteText: {
-  color: '#fff',
-  fontSize: 16,
-  lineHeight:22,
-},
-noteTime: {
-  color: '#888',
-  fontSize: 13,
-  marginBottom: 6,
-},
-recordButton: {
-  backgroundColor: '#333333',
-  paddingVertical: 14,
-  paddingHorizontal: 40,
-  borderRadius: 999,
-  alignSelf: 'center',
-  marginVertical: 20,
-},
-recordButtonText: {
-  color: '#fff',
-  fontSize: 16,
-  fontWeight: '600',
-  textShadowColor: '#000',
-  textShadowOffset: {width: 0, height: 1},
-  textShadowRadius: 2,
-},
-bigMicButton:{
-  backgroundColor: '#ff3333',
-  width: 100,
-  height: 100,
-  borderRadius: 50,
-  alignItems: 'center',
-  justifyContent: 'center',
-  alignSelf: 'center',
-  marginVertical: 20,
-},
-micIcon:{
-  color: '#fff',
-  fontSize: 36,
-},
-deleteButton:{
-  backgroundColor: '#ff4444',
-  justifyContent: 'center',
-  alignItems: 'center',
-  width: 70,
-  borderRadius: 12,
-  marginVertical: 6,
-},
-deleteText: {
-  color: '#fff',
-  fontSize: 20,
-},
-menuItem:{
-  flexDirection: 'row',
-  alignItems: 'center',
-  marginBottom: 20,
-},
-menuIcon:{
-  fontsize: 20,
-  marginRight: 8,
-  color: '#fff',
-},
-menuLabel: {
-  fontSize: 16,
-  color: '#fff',
-},
-
-
-
-  
+  listeningText: { color: '#9cf', fontSize: 13, marginLeft: 8 },
+  sectionLabel: {
+    color: '#aaa',
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 8,
+  },
 });
